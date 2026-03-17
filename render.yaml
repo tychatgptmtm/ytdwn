@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: telegram-youtube-downloader-bot
+    name: ytdwn
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
