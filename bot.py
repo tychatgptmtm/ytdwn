@@ -3,10 +3,11 @@ import logging
 import os
 import re
 import shutil
+import threading
 import uuid
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
-from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -14,43 +15,58 @@ from aiogram.filters import CommandStart
 from aiogram.types import FSInputFile, Message
 import yt_dlp
 
-# =========================
-# CONFIG
-# =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 PORT = int(os.getenv("PORT", "10000"))
-
-if not BOT_TOKEN:
-    raise ValueError("Не найден BOT_TOKEN в переменных окружения")
-
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
-# Консервативные лимиты, чтобы бот стабильно работал.
-SEND_AS_VIDEO_MAX_BYTES = 45 * 1024 * 1024
-SEND_AS_DOCUMENT_MAX_BYTES = 49 * 1024 * 1024
+MAX_VIDEO_BYTES = 45 * 1024 * 1024
+MAX_DOCUMENT_BYTES = 49 * 1024 * 1024
+
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN not found in environment variables")
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("youtube_bot")
 
 bot = Bot(
     token=BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
 )
 dp = Dispatcher()
 
 YOUTUBE_REGEX = re.compile(
-    r"(https?://(?:www\.)?(?:youtube\.com/watch\?v=[^\s]+|youtu\.be/[^\s]+|youtube\.com/shorts/[^\s]+))",
+    r"(https?://(?:www\.)?(?:youtube\.com/watch\?v=[^\s&]+|youtu\.be/[^\s?&]+|youtube\.com/shorts/[^\s?&]+)[^\s]*)",
     re.IGNORECASE,
 )
 
 
-# =========================
-# HELPERS
-# =========================
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path in ("/", "/healthz"):
+            self.send_response(200)
+            self.send_header("Content-type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"ok")
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        return
+
+
+def start_health_server():
+    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    logger.info("Health server started on port %s", PORT)
+    return server
+
+
 def extract_youtube_url(text: str) -> str | None:
     if not text:
         return None
@@ -58,43 +74,74 @@ def extract_youtube_url(text: str) -> str | None:
     return match.group(1) if match else None
 
 
-def sanitize_caption(text: str | None) -> str:
-    if not text:
-        return "Готово."
-    text = text.replace("<", "").replace(">", "")
-    return text[:900]
+def _find_downloaded_file(unique_id: str) -> Path:
+    matches = sorted(DOWNLOAD_DIR.glob(f"{unique_id}.*"))
+    media_matches = [m for m in matches if m.suffix.lower() not in {".part", ".ytdl", ".temp"}]
+    if media_matches:
+        return media_matches[0]
+    raise FileNotFoundError("Downloaded file not found")
 
 
-def download_youtube_video(url: str) -> tuple[Path, dict]:
-    unique_id = str(uuid.uuid4())
-    outtmpl = str(DOWNLOAD_DIR / f"{unique_id}.%(ext)s")
-
-    ydl_opts = {
+def _progressive_opts(outtmpl: str) -> dict:
+    return {
         "outtmpl": outtmpl,
+        "format": "best[ext=mp4][vcodec!=none][acodec!=none]/best[protocol=https][vcodec!=none][acodec!=none]/best",
         "noplaylist": True,
         "quiet": True,
-        "no_warnings": True,
+        "no_warnings": False,
         "restrictfilenames": True,
-        "windowsfilenames": True,
-        "merge_output_format": "mp4",
-        "format": "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4][height<=720]/best[height<=720]/best",
+        "socket_timeout": 20,
+        "retries": 2,
+        "fragment_retries": 2,
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0",
+        },
     }
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        prepared = Path(ydl.prepare_filename(info))
 
-        possible_files = []
-        possible_mp4 = prepared.with_suffix(".mp4")
-        possible_files.append(possible_mp4)
-        possible_files.append(prepared)
-        possible_files.extend(DOWNLOAD_DIR.glob(f"{unique_id}.*"))
+def _fallback_opts(outtmpl: str) -> dict:
+    return {
+        "outtmpl": outtmpl,
+        "format": "best",
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": False,
+        "restrictfilenames": True,
+        "socket_timeout": 20,
+        "retries": 2,
+        "fragment_retries": 2,
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0",
+        },
+    }
 
-        for file_path in possible_files:
-            if file_path.exists() and file_path.is_file():
-                return file_path, info
 
-    raise FileNotFoundError("Скачанный файл не найден")
+def download_youtube_video(url: str) -> tuple[Path, str]:
+    unique_id = str(uuid.uuid4())
+    outtmpl = str(DOWNLOAD_DIR / f"{unique_id}.%(ext)s")
+    errors: list[str] = []
+
+    for attempt_name, opts_factory in (
+        ("progressive", _progressive_opts),
+        ("fallback", _fallback_opts),
+    ):
+        try:
+            logger.info("Download attempt: %s | %s", attempt_name, url)
+            with yt_dlp.YoutubeDL(opts_factory(outtmpl)) as ydl:
+                info = ydl.extract_info(url, download=True)
+                prepared = Path(ydl.prepare_filename(info))
+
+            if prepared.exists() and prepared.suffix.lower() not in {".part", ".temp", ".ytdl"}:
+                return prepared, info.get("title") or "video"
+
+            found = _find_downloaded_file(unique_id)
+            return found, info.get("title") or "video"
+        except Exception as e:
+            msg = f"{attempt_name}: {e}"
+            errors.append(msg)
+            logger.exception("Download failed: %s", msg)
+
+    raise RuntimeError(" | ".join(errors))
 
 
 async def safe_remove(path: Path | None):
@@ -104,19 +151,15 @@ async def safe_remove(path: Path | None):
         if path.exists():
             path.unlink()
     except Exception:
-        logger.exception("Не удалось удалить файл: %s", path)
+        logger.exception("Failed to remove file: %s", path)
 
 
-# =========================
-# BOT HANDLERS
-# =========================
 @dp.message(CommandStart())
 async def start_handler(message: Message):
     await message.answer(
         "Привет.\n\n"
-        "Пришли ссылку на YouTube или YouTube Shorts, и я попробую скачать видео.\n\n"
-        "Если файл небольшой — отправлю как обычное видео.\n"
-        "Если побольше — отправлю как файл."
+        "Пришли ссылку на YouTube или Shorts, и я попробую скачать видео.\n\n"
+        "Если файл небольшой — отправлю как видео. Если побольше — как файл."
     )
 
 
@@ -128,92 +171,51 @@ async def youtube_handler(message: Message):
         return
 
     status = await message.answer("Скачиваю видео...")
-    file_path = None
+    video_path: Path | None = None
 
     try:
-        file_path, info = await asyncio.to_thread(download_youtube_video, url)
+        video_path, title = await asyncio.to_thread(download_youtube_video, url)
+        file_size = video_path.stat().st_size
+        input_file = FSInputFile(video_path, filename=video_path.name)
 
-        if not file_path.exists():
-            await status.edit_text("Файл не найден после скачивания.")
-            return
-
-        file_size = file_path.stat().st_size
-        title = sanitize_caption(info.get("title"))
-        upload = FSInputFile(file_path)
-
-        if file_size <= SEND_AS_VIDEO_MAX_BYTES:
-            await message.answer_video(
-                video=upload,
-                caption=title,
-                supports_streaming=True,
+        if file_size <= MAX_VIDEO_BYTES:
+            await message.answer_video(video=input_file, caption=title[:900])
+        elif file_size <= MAX_DOCUMENT_BYTES:
+            await message.answer_document(document=input_file, caption=title[:900])
+        else:
+            await message.answer(
+                "Видео скачалось, но файл слишком большой для отправки через Telegram."
             )
-            await status.delete()
-            return
 
-        if file_size <= SEND_AS_DOCUMENT_MAX_BYTES:
-            await message.answer_document(
-                document=upload,
-                caption=f"{title}\n\nОтправил как файл, потому что видео получилось крупнее обычного лимита.",
-            )
-            await status.delete()
-            return
+        await status.delete()
+    except Exception as e:
+        logger.exception("Handler error for URL %s", url)
+        error_text = str(e)
+        user_text = "Не получилось скачать видео."
 
-        size_mb = round(file_size / 1024 / 1024, 1)
-        await status.edit_text(
-            f"Видео скачалось, но файл слишком большой для отправки ботом: {size_mb} MB.\n"
-            "Попробуй другое видео или короче ролик."
-        )
+        lowered = error_text.lower()
+        if "sign in to confirm" in lowered or "not a bot" in lowered:
+            user_text += "\nYouTube временно режет скачивание с сервера."
+        elif "private video" in lowered:
+            user_text += "\nЭто приватное видео."
+        elif "unavailable" in lowered:
+            user_text += "\nВидео недоступно."
+        else:
+            user_text += "\nПопробуй другую ссылку или повтори позже."
 
-    except Exception:
-        logger.exception("Ошибка при обработке ссылки")
-        await status.edit_text(
-            "Не получилось скачать видео.\n"
-            "Иногда ссылка временно недоступна или YouTube режет выдачу."
-        )
+        await status.edit_text(user_text)
     finally:
-        await safe_remove(file_path)
+        await safe_remove(video_path)
 
 
-# =========================
-# HEALTH SERVER FOR RENDER
-# =========================
-async def health_handler(_: web.Request) -> web.Response:
-    return web.json_response({"ok": True, "service": "youtube-downloader-bot"})
-
-
-async def root_handler(_: web.Request) -> web.Response:
-    return web.Response(text="YouTube Telegram bot is running.")
-
-
-async def run_web_server() -> None:
-    app = web.Application()
-    app.router.add_get("/", root_handler)
-    app.router.add_get("/healthz", health_handler)
-
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
-    await site.start()
-
-    logger.info("Health server started on port %s", PORT)
-
+async def main():
+    server = start_health_server()
     try:
-        while True:
-            await asyncio.sleep(3600)
+        await dp.start_polling(bot)
     finally:
-        await runner.cleanup()
-
-
-async def main() -> None:
-    logger.info("Bot started")
-    await asyncio.gather(
-        dp.start_polling(bot),
-        run_web_server(),
-    )
+        server.shutdown()
+        shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    finally:
-        shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
+    asyncio.run(main())

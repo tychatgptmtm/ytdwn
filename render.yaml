@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: ytdwn
+    name: youtube-downloader-bot-v2
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
