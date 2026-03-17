@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: telegram-youtube-downloader-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    healthCheckPath: /healthz
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
